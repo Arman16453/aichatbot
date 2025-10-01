@@ -8,13 +8,14 @@
     "start": "next start"
   },
   "dependencies": {
-    "@mui/material": "^7.3.2",
-    "@mui/icons-material": "^7.3.2",
     "@emotion/react": "^11.14.0",
     "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^7.3.2",
+    "@mui/material": "^7.3.2",
     "next": "15.5.4",
     "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react-dom": "19.1.0",
+    "react-error-boundary": "^6.0.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

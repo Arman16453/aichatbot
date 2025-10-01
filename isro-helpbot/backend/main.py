@@ -1,10 +1,56 @@
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from bs4 import BeautifulSoup
 import requests
 import json
-from typing import Dict
+from typing import Dict, List, Optional
+from datetime import datetime
+import uuid
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
 
 app = FastAPI()
+
+# MongoDB setup
+mongo_client = AsyncIOMotorClient("mongodb://localhost:27017")
+db = mongo_client.isro_chatbot
+
+class Session(BaseModel):
+    session_id: str
+    user_id: Optional[str]
+    created_at: datetime
+    last_active: datetime
+    context: Dict = {}
+
+class Message(BaseModel):
+    id: str
+    session_id: str
+    text: str
+    sender: str
+    timestamp: datetime
+    context: Dict = {}
+
+app = FastAPI()
+
+# Store active websocket connections
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def send_message(self, message: str, websocket: WebSocket):
+        await websocket.send_json({
+            "text": message,
+            "timestamp": datetime.now().isoformat(),
+            "sender": "bot"
+        })
+
+manager = ConnectionManager()
 
 # Store scraped content
 content_database: Dict[str, str] = {}
