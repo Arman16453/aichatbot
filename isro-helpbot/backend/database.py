@@ -22,8 +22,7 @@ MONGO_CONFIG = {
         'wtimeoutMS': 30000,                  # Increased write timeout
         'maxPoolSize': 10,                    # Reduced pool size for better stability
         'minPoolSize': 1,
-        'serverSelectionTryOnce': False,      # Allow multiple server selection attempts
-        'connectWithNoPrimary': True,         # Allow reads from secondaries
+        'serverSelectionTimeoutMS': 30000,   # Server selection timeout
         'waitQueueTimeoutMS': 30000           # Wait queue timeout
     }
 }
@@ -109,9 +108,17 @@ async def close_mongodb_connection():
         db = None
         is_connected = False
 
+def get_database():
+    """Get the database instance"""
+    global db
+    return db
+
 async def close_mongodb_connection():
     """Close MongoDB connection"""
-    global client
-    if client:
+    global client, db, is_connected
+    if client is not None:
         client.close()
         print("Closed MongoDB connection")
+        client = None
+        db = None
+        is_connected = False

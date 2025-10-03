@@ -14,8 +14,8 @@ interface Config {
 
 // API Configuration
 export const config: Config = {
-    API_URL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
-    WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000',
+    API_URL: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8001',
+    WS_URL: process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8001',
     TIMEOUT: 30000,       // Increased timeout to 30 seconds
     RETRY: {
         MAX_ATTEMPTS: 3,  // Reduced attempts but with longer timeouts

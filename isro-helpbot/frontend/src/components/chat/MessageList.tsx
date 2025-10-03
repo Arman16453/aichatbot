@@ -9,11 +9,10 @@ interface Message {
   text: string;
   sender: 'user' | 'bot' | 'system';
   timestamp: Date;
-  status: 'sent' | 'received' | 'processing' | 'completed' | 'error';
+  status?: 'sent' | 'received' | 'processing' | 'completed' | 'error';
   error?: string;
-  context?: Record<string, any>;
+  context?: Record<string, unknown>;
   in_response_to?: string;
-  session_id: string;
 }
 
 interface MessageListProps {

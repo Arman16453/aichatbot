@@ -1,7 +1,7 @@
 import { config, ENDPOINTS, getApiUrl } from '@/lib/config';
 
 // API Types
-exporexport const retryWithBackoff = async <T>(
+export const retryWithBackoff = async <T>(
   operation: () => Promise<T>,
   maxAttempts = config.RETRY.MAX_ATTEMPTS,
   initialDelay = config.RETRY.INITIAL_DELAY,
@@ -35,23 +35,26 @@ exporexport const retryWithBackoff = async <T>(
       console.log(`Waiting ${delay}ms before next attempt`);
       await sleep(delay);
       
-      attempt++;sage {
-    id: string;
-    content: string;
-    role: 'user' | 'assistant';
-    timestamp: string;
+      attempt++;
+    }
+  }
+
+  throw lastError || new Error('Operation failed after all attempts');
 }
 
 export interface SessionResponse {
-    sessionId: string;
+    session_id: string;
+    created_at: string;
 }
 
 // API Types
 export interface Message {
   id: string;
-  content: string;
-  role: 'user' | 'assistant';
+  text: string;
+  sender: 'user' | 'bot' | 'system';
   timestamp: string;
+  status?: 'sent' | 'received' | 'processing' | 'completed' | 'error';
+  error?: string;
 }
 
 export class NetworkError extends Error {
@@ -121,44 +124,6 @@ const fetchWithTimeout = async (
   }
 };
 
-export const retryWithBackoff = async <T>(
-  operation: () => Promise<T>,
-  maxAttempts = config.RETRY.MAX_ATTEMPTS,
-  initialDelay = config.RETRY.INITIAL_DELAY,
-  maxDelay = config.RETRY.MAX_DELAY
-): Promise<T> => {
-  let lastError: Error | null = null;
-  let attempt = 1;
-
-  while (attempt <= maxAttempts) {
-    try {
-      console.log(`Operation attempt ${attempt}/${maxAttempts}`);
-      const result = await operation();
-      console.log(`Attempt ${attempt} successful`);
-      return result;
-    } catch (error: unknown) {
-      const currentError = error instanceof Error ? error : new Error('Unknown error occurred');
-      lastError = currentError;
-      
-      console.log(`Attempt ${attempt}/${maxAttempts} failed:`, currentError.message);
-      
-      if (attempt === maxAttempts) {
-        console.log(`All ${maxAttempts} attempts failed`);
-        break;
-      }
-      
-      const jitter = Math.random() * 500;
-      const delay = Math.min(initialDelay * Math.pow(2, attempt - 1) + jitter, maxDelay);
-      
-      console.log(`Waiting ${delay}ms before next attempt`);
-      await sleep(delay);
-      
-      attempt++;
-    }
-  }
-
-  throw lastError || new Error('Operation failed after all attempts');
-};
 
 export const api = {
   async createSession(): Promise<SessionResponse> {
