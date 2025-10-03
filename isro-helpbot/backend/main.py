@@ -1,18 +1,87 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from bs4 import BeautifulSoup
 import requests
 import json
-from typing import Dict, List, Optional
+import asyncio
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 import uuid
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
+from routes import router
+import database
 
-app = FastAPI()
+# Initialize FastAPI with metadata
+app = FastAPI(
+    title="ISRO HelpBot API",
+    description="Real-time chat API for ISRO HelpBot",
+    version="1.0.0"
+)
 
-# MongoDB setup
-mongo_client = AsyncIOMotorClient("mongodb://localhost:27017")
-db = mongo_client.isro_chatbot
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    print("Starting up the application...")
+    try:
+        await database.connect_to_mongodb()
+        print("Database connection established")
+    except Exception as e:
+        print(f"Failed to connect to database: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("Shutting down the application...")
+    await database.close_mongodb_connection()
+
+# Initialize global variables
+content_database: Dict[str, str] = {}
+
+def scrape_mosdac() -> str:
+    """Scrape content from MOSDAC website"""
+    try:
+        response = requests.get("https://www.mosdac.gov.in", timeout=10)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # Extract text content
+            text_content = ' '.join([p.get_text() for p in soup.find_all(['p', 'div', 'section'])])
+            return text_content
+        return ""
+    except Exception as e:
+        print(f"Error scraping MOSDAC: {e}")
+        return ""
+
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Initialize connections and data on startup"""
+    try:
+        # Connect to MongoDB
+        await database.connect_to_mongodb()
+        print("MongoDB connection established")
+        
+        # Initialize content database
+        content = scrape_mosdac()
+        global content_database
+        content_database["mosdac"] = content
+        print("Content database initialized")
+    except Exception as e:
+        print(f"Startup error: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close connections on shutdown"""
+    await database.close_mongodb_connection()
 
 class Session(BaseModel):
     session_id: str
@@ -20,6 +89,7 @@ class Session(BaseModel):
     created_at: datetime
     last_active: datetime
     context: Dict = {}
+    status: str = "active"  # active, ended
 
 class Message(BaseModel):
     id: str
@@ -28,27 +98,73 @@ class Message(BaseModel):
     sender: str
     timestamp: datetime
     context: Dict = {}
+    status: str = "sent"  # sent, received, processing, completed, error
+    error: Optional[str] = None
 
-app = FastAPI()
+# Include routes
+app.include_router(router, prefix="/api")
 
 # Store active websocket connections
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.user_sessions: Dict[str, Set[str]] = {}  # user_id -> set of session_ids
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, session_id: str, user_id: Optional[str] = None) -> None:
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[session_id] = websocket
+        
+        if user_id:
+            if user_id not in self.user_sessions:
+                self.user_sessions[user_id] = set()
+            self.user_sessions[user_id].add(session_id)
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        # Send connection acknowledgment
+        await self.send_system_message(
+            session_id,
+            "Connected to MOSDAC AI Assistant"
+        )
 
-    async def send_message(self, message: str, websocket: WebSocket):
-        await websocket.send_json({
-            "text": message,
+    def disconnect(self, session_id: str, user_id: Optional[str] = None) -> None:
+        if session_id in self.active_connections:
+            del self.active_connections[session_id]
+        
+        if user_id and user_id in self.user_sessions:
+            self.user_sessions[user_id].discard(session_id)
+            if not self.user_sessions[user_id]:
+                del self.user_sessions[user_id]
+
+    async def send_message(self, session_id: str, message: Dict) -> None:
+        if session_id in self.active_connections:
+            websocket = self.active_connections[session_id]
+            try:
+                await websocket.send_json(message)
+                # Store message in MongoDB
+                await self.store_message(session_id, message)
+            except Exception as e:
+                print(f"Error sending message: {e}")
+                self.disconnect(session_id)
+
+    async def send_system_message(self, session_id: str, text: str) -> None:
+        message = {
+            "id": str(uuid.uuid4()),
+            "text": text,
+            "sender": "system",
             "timestamp": datetime.now().isoformat(),
-            "sender": "bot"
-        })
+            "status": "sent"
+        }
+        await self.send_message(session_id, message)
+
+    async def store_message(self, session_id: str, message: Dict) -> None:
+        """Store message in MongoDB"""
+        try:
+            await db.messages.insert_one({
+                **message,
+                "session_id": session_id,
+                "created_at": datetime.now()
+            })
+        except Exception as e:
+            print(f"Error storing message: {e}")
 
 manager = ConnectionManager()
 
@@ -104,27 +220,76 @@ def startup_event():
     content = scrape_mosdac()
     content_database["mosdac"] = content
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
+@app.websocket("/ws/{session_id}")
+async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: Optional[str] = None):
+    await manager.connect(websocket, session_id, user_id)
     
     try:
         while True:
-            # Receive message from client
-            data = await websocket.receive_text()
+            data = await websocket.receive_json()
+            user_message = data.get("text", "")
+            message_id = str(uuid.uuid4())
             
-            # Process the message
-            response = await get_ai_response(data)
+            # Create message data
+            message_data = {
+                "id": message_id,
+                "text": user_message,
+                "timestamp": datetime.now().isoformat(),
+                "sender": "user",
+                "session_id": session_id,
+                "user_id": user_id,
+                "status": "received"
+            }
             
-            # Send response back to client
-            await websocket.send_text(json.dumps({
-                "message": response,
-                "type": "bot"
-            }))
+            # Store user message
+            await db.messages.insert_one(message_data)
             
+            # Send message received acknowledgment
+            await manager.send_message(session_id, {
+                **message_data,
+                "status": "processing"
+            })
+            
+            try:
+                # Get bot response
+                bot_response = await get_ai_response(user_message)
+                
+                # Create bot message data
+                bot_message = {
+                    "id": str(uuid.uuid4()),
+                    "text": bot_response,
+                    "timestamp": datetime.now().isoformat(),
+                    "sender": "bot",
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "status": "sent",
+                    "in_response_to": message_id
+                }
+                
+                # Store and send bot response
+                await db.messages.insert_one(bot_message)
+                await manager.send_message(session_id, bot_message)
+                
+                # Update original message status to completed
+                await manager.send_message(session_id, {
+                    **message_data,
+                    "status": "completed"
+                })
+                
+            except Exception as e:
+                print(f"Error generating response: {e}")
+                # Send error status
+                await manager.send_message(session_id, {
+                    **message_data,
+                    "status": "error",
+                    "error": str(e)
+                })
+                
+    except WebSocketDisconnect:
+        manager.disconnect(session_id, user_id)
     except Exception as e:
         print(f"WebSocket error: {e}")
-        await websocket.close()
+        manager.disconnect(session_id, user_id)
 
 if __name__ == "__main__":
     import uvicorn

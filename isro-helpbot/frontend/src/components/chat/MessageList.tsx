@@ -7,8 +7,13 @@ import TimeStamp from './TimeStamp';
 interface Message {
   id: string;
   text: string;
-  sender: 'user' | 'bot';
+  sender: 'user' | 'bot' | 'system';
   timestamp: Date;
+  status: 'sent' | 'received' | 'processing' | 'completed' | 'error';
+  error?: string;
+  context?: Record<string, any>;
+  in_response_to?: string;
+  session_id: string;
 }
 
 interface MessageListProps {
@@ -38,14 +43,51 @@ const MessageList: React.FC<MessageListProps> = ({ messages }) => {
             sx={{
               p: 2,
               maxWidth: '70%',
-              bgcolor: message.sender === 'user' ? 'primary.main' : '#f8f9fa',
+              bgcolor: message.sender === 'user' ? 'primary.main' : 
+                      message.sender === 'system' ? '#e3f2fd' : '#f8f9fa',
               color: message.sender === 'user' ? 'white' : 'text.primary',
               borderRadius: message.sender === 'user' ? '20px 20px 5px 20px' : '20px 20px 20px 5px',
               boxShadow: '0 1px 2px rgba(0,0,0,0.1)',
+              opacity: message.status === 'error' ? 0.7 : 1,
+              position: 'relative'
             }}
           >
             <Typography variant="body1">{message.text}</Typography>
-            <TimeStamp date={message.timestamp} />
+            <Box sx={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'space-between',
+              mt: 1 
+            }}>
+              <TimeStamp date={message.timestamp} />
+              {message.status && message.status !== 'completed' && (
+                <Typography 
+                  variant="caption" 
+                  sx={{ 
+                    ml: 1,
+                    color: message.status === 'error' ? 'error.main' : 
+                           message.sender === 'user' ? 'white' : 'text.secondary'
+                  }}
+                >
+                  {message.status === 'error' ? 'Error sending message' :
+                   message.status === 'processing' ? 'Processing...' :
+                   message.status === 'sent' ? 'Sent' :
+                   message.status === 'received' ? 'Received' : ''}
+                </Typography>
+              )}
+            </Box>
+            {message.error && (
+              <Typography 
+                variant="caption" 
+                sx={{ 
+                  color: 'error.main',
+                  display: 'block',
+                  mt: 1
+                }}
+              >
+                {message.error}
+              </Typography>
+            )}
           </Paper>
         </Box>
       ))}
