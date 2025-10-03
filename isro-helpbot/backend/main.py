@@ -8,8 +8,8 @@ from typing import Dict, List, Optional, Set
 from datetime import datetime
 import uuid
 from pydantic import BaseModel
-import routes
-import database
+from . import routes
+from . import database
 
 # Initialize FastAPI with metadata
 app = FastAPI(

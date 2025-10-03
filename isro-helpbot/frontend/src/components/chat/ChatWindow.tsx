@@ -226,10 +226,16 @@ export default function ChatWindow() {
           setIsProcessing(false);
         };
 
-        ws.onerror = (error) => {
-          console.error('WebSocket error:', error);
+        ws.onerror = (event) => {
+          // event is usually an Event with limited info; log connection readyState too
+          console.error('WebSocket error event:', event, 'readyState:', ws.readyState);
           setIsConnecting(false);
           setError('Connection failed. Please check if the server is running and try again.');
+          try {
+            ws.close();
+          } catch (e) {
+            console.warn('Error closing websocket after error:', e);
+          }
           wsRef.current = null;
         };
 

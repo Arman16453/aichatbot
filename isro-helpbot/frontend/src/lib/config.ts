@@ -44,6 +44,34 @@ export function getApiUrl(endpoint: string): string {
 }
 
 export function getWsUrl(endpoint: string): string {
+    // If the app is running in the browser, ensure the WS protocol matches the page protocol
+    try {
+        if (typeof window !== 'undefined') {
+            const pageIsSecure = window.location.protocol === 'https:';
+            // If WS_URL is provided explicitly, adapt its protocol when page is secure
+            if (config.WS_URL) {
+                try {
+                    const u = new URL(config.WS_URL);
+                    if (pageIsSecure && u.protocol === 'ws:') u.protocol = 'wss:';
+                    if (!pageIsSecure && u.protocol === 'wss:') u.protocol = 'ws:';
+                    return `${u.origin}${endpoint}`;
+                } catch {
+                    // fallback to using the string directly
+                    if (pageIsSecure && config.WS_URL.startsWith('ws://')) {
+                        return config.WS_URL.replace('ws://', 'wss:') + endpoint;
+                    }
+                    if (!pageIsSecure && config.WS_URL.startsWith('wss://')) {
+                        return config.WS_URL.replace('wss://', 'ws://') + endpoint;
+                    }
+                    return `${config.WS_URL}${endpoint}`;
+                }
+            }
+        }
+    } catch (e) {
+        // If anything goes wrong, fall back to the configured WS_URL
+        console.warn('getWsUrl fallback:', e);
+    }
+
     return `${config.WS_URL}${endpoint}`;
 }
 
