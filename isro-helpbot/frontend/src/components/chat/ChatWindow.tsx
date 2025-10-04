@@ -45,6 +45,10 @@ export default function ChatWindow() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectAttempts = useRef(0);
+  const reconnectTimer = useRef<number | null>(null);
+  const isUnmounted = useRef(false);
+  const outgoingQueue = useRef<Array<string>>([]);
 
   // Load session from localStorage
   useEffect(() => {
@@ -156,81 +160,124 @@ export default function ChatWindow() {
   }, []);
 
   useEffect(() => {
+    // Connect with guard to avoid duplicate sockets
+    function scheduleReconnect(delayMs: number) {
+      if (isUnmounted.current) return;
+      if (reconnectTimer.current) window.clearTimeout(reconnectTimer.current as number);
+      reconnectTimer.current = window.setTimeout(() => {
+        reconnectTimer.current = null;
+        connect();
+      }, delayMs);
+    }
+
     async function connect() {
       if (!session.session_id) return;
-      
+
+      // If a socket already exists and is open or connecting, do not create a new one
+      if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+
       try {
         setIsConnecting(true);
-        const ws = new WebSocket(getWsUrl(`/ws/${session.session_id}`));
-        
+        const url = getWsUrl(`/ws/${session.session_id}`);
+        const ws = new WebSocket(url);
+
         ws.onopen = () => {
-          console.log('Connected to WebSocket server');
+          console.log('Connected to WebSocket server', url);
+          reconnectAttempts.current = 0;
           setIsConnecting(false);
           setError(null);
+          // Flush any queued messages
+          try {
+            while (outgoingQueue.current.length > 0 && ws.readyState === WebSocket.OPEN) {
+              const msg = outgoingQueue.current.shift();
+              if (msg) ws.send(msg);
+            }
+          } catch (e) {
+            console.warn('Error flushing outgoing queue:', e);
+          }
         };
 
         ws.onclose = (event) => {
           console.log('WebSocket connection closed:', event.code, event.reason);
-          if (event.code !== 1000) { // Not a normal closure
+          wsRef.current = null;
+          // Only attempt reconnect for abnormal closures
+          if (!isUnmounted.current && event.code !== 1000) {
+            reconnectAttempts.current = (reconnectAttempts.current || 0) + 1;
+            const delay = Math.min(3000 * Math.pow(2, reconnectAttempts.current - 1), 30000);
+            console.warn(`Socket closed unexpectedly (code=${event.code}). Reconnecting in ${delay}ms (attempt ${reconnectAttempts.current})`);
             setError('Connection lost. Attempting to reconnect...');
-            // Try to reconnect after 3 seconds
-            setTimeout(connect, 3000);
+            scheduleReconnect(delay);
           }
         };
 
         ws.onmessage = (event) => {
-          const data = JSON.parse(event.data);
-          
-          // Handle message updates
-          setMessages(prev => {
-            const msgIndex = prev.findIndex(msg => msg.id === data.id);
-            
-            if (msgIndex >= 0) {
-              // Update existing message
-              const updatedMessages = [...prev];
-              updatedMessages[msgIndex] = {
-                ...updatedMessages[msgIndex],
-                ...data,
-                timestamp: new Date(data.timestamp)
-              };
-              return updatedMessages;
-            } else {
-              // Add new message
-              return [...prev, {
-                ...data,
-                timestamp: new Date(data.timestamp)
-              }];
+          try {
+            const data = JSON.parse(event.data);
+
+            // Handle message updates
+            setMessages(prev => {
+              const msgIndex = prev.findIndex(msg => msg.id === data.id);
+
+              if (msgIndex >= 0) {
+                // Update existing message
+                const updatedMessages = [...prev];
+                updatedMessages[msgIndex] = {
+                  ...updatedMessages[msgIndex],
+                  ...data,
+                  timestamp: new Date(data.timestamp)
+                };
+                return updatedMessages;
+              } else {
+                // Add new message
+                return [...prev, {
+                  ...data,
+                  timestamp: new Date(data.timestamp)
+                }];
+              }
+            });
+
+            // Update processing state based on message status
+            if (data.status === 'processing') {
+              setIsProcessing(true);
+            } else if (['completed', 'error'].includes(data.status)) {
+              setIsProcessing(false);
             }
-          });
 
-          // Update processing state based on message status
-          if (data.status === 'processing') {
-            setIsProcessing(true);
-          } else if (['completed', 'error'].includes(data.status)) {
+            // Update session context if provided
+            if (data.context) {
+              setSession(prev => ({
+                ...prev,
+                context: {
+                  ...prev.context,
+                  ...data.context
+                },
+                lastActive: new Date()
+              }));
+
+            }
+
             setIsProcessing(false);
+          } catch (error) {
+            console.error('Error handling WebSocket message:', error, 'Raw data:', event.data);
           }
-
-          // Update session context if provided
-          if (data.context) {
-            setSession(prev => ({
-              ...prev,
-              context: {
-                ...prev.context,
-                ...data.context
-              },
-              lastActive: new Date()
-            }));
-
-          }
-          
-          setIsProcessing(false);
         };
 
         ws.onerror = (event) => {
-          // event is usually an Event with limited info; log connection readyState too
-          console.error('WebSocket error event:', event, 'readyState:', ws.readyState);
-          setIsConnecting(false);
-          setError('Connection failed. Please check if the server is running and try again.');
+          // event may be opaque; log what we can safely access
+          try {
+            const state = ws?.readyState;
+            console.error('WebSocket error event:', { type: (event as Event).type, state }, event);
+          } catch (e) {
+            console.error('WebSocket error (unable to serialize event):', e);
+          }
+
+          // Only set user-facing error when socket is closed / failed
+          if (ws.readyState === WebSocket.CLOSED) {
+            setError('Connection failed. Please check if the server is running and try again.');
+          }
+
           try {
             ws.close();
           } catch (e) {
@@ -240,19 +287,53 @@ export default function ChatWindow() {
         };
 
         wsRef.current = ws;
-      } catch {
+      } catch (err) {
+        console.error('Failed to create WebSocket:', err);
         setError('Failed to connect');
         setIsConnecting(false);
+        // schedule reconnect
+        reconnectAttempts.current = (reconnectAttempts.current || 0) + 1;
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts.current - 1), 30000);
+        scheduleReconnect(delay);
       }
     }
 
     connect();
-    return () => wsRef.current?.close();
+
+    return () => {
+      isUnmounted.current = true;
+      if (reconnectTimer.current) {
+        window.clearTimeout(reconnectTimer.current as number);
+        reconnectTimer.current = null;
+      }
+      try {
+        wsRef.current?.close();
+      } catch (e) {
+        // ignore
+      }
+      wsRef.current = null;
+    };
   }, [session.session_id]);
 
   const sendMessage = async (text: string) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      setError('Not connected to server. Please wait while we reconnect...');
+      // Queue the message so it's sent when connection is restored
+      setError('Not connected to server. Your message will be sent when reconnected.');
+      const messageId = crypto.randomUUID();
+      const newMessage: Message = {
+        id: messageId,
+        text,
+        sender: 'user',
+        timestamp: new Date(),
+        status: 'sent'
+      };
+
+      // Add message to UI immediately
+      setMessages(prev => [...prev, newMessage]);
+
+      // Queue send payload
+      const payload = JSON.stringify({ id: messageId, text, timestamp: new Date().toISOString() });
+      outgoingQueue.current.push(payload);
       return;
     }
 
@@ -268,30 +349,33 @@ export default function ChatWindow() {
     try {
       // Add message to UI immediately with 'sent' status
       setMessages(prev => [...prev, newMessage]);
-      
+
       // Send message through WebSocket
-      wsRef.current.send(JSON.stringify({
-        id: messageId,
-        text,
-        timestamp: new Date().toISOString()
-      }));
-      
+      const payload = JSON.stringify({ id: messageId, text, timestamp: new Date().toISOString() });
+      try {
+        wsRef.current.send(payload);
+      } catch (e) {
+        console.warn('WebSocket send failed, queueing message:', e);
+        outgoingQueue.current.push(payload);
+        setError('Message queued; will be sent when reconnected.');
+      }
+
       // Update session's last active timestamp
       setSession(prev => ({
         ...prev,
         lastActive: new Date()
       }));
-      
+
     } catch (error) {
       console.error('Failed to send message:', error);
-      
+
       // Update message status to error
       setMessages(prev => prev.map(msg =>
         msg.id === messageId
           ? { ...msg, status: 'error', error: 'Failed to send message' }
           : msg
       ));
-      
+
       setError('Failed to send message. Please try again.');
     }
   };

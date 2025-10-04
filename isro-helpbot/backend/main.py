@@ -115,10 +115,10 @@ class ConnectionManager:
             self.user_sessions[user_id].add(session_id)
 
         # Send connection acknowledgment
-        await self.send_system_message(
-            session_id,
-            "Connected to MOSDAC AI Assistant"
-        )
+        # await self.send_system_message(
+        #     session_id,
+        #     "Connected to MOSDAC AI Assistant"
+        # )
 
     def disconnect(self, session_id: str, user_id: Optional[str] = None) -> None:
         if session_id in self.active_connections:
@@ -173,11 +173,17 @@ class ConnectionManager:
         """Store message in MongoDB"""
         try:
             if db is not None:
-                await db.messages.insert_one({
-                    **message,
-                    "session_id": session_id,
-                    "created_at": datetime.now()
-                })
+                # Use upsert to avoid duplicate key errors
+                await db.messages.replace_one(
+                    {"id": message["id"], "session_id": session_id},  # Filter by message id and session
+                    {
+                        **message,
+                        "session_id": session_id,
+                        "created_at": datetime.now(),
+                        "updated_at": datetime.now()
+                    },
+                    upsert=True  # Insert if doesn't exist, update if exists
+                )
         except Exception as e:
             print(f"Error storing message: {e}")
 
@@ -249,7 +255,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: Opt
             # Store user message
             if db is not None:
                 try:
-                    await db.messages.insert_one(message_data)
+                    await db.messages.replace_one(
+                        {"id": message_data["id"], "session_id": session_id},
+                        {
+                            **message_data,
+                            "session_id": session_id,
+                            "created_at": datetime.now(),
+                            "updated_at": datetime.now()
+                        },
+                        upsert=True
+                    )
                 except Exception as e:
                     print(f"Error storing user message: {e}")
             
@@ -278,7 +293,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: Opt
                 # Store and send bot response
                 if db is not None:
                     try:
-                        await db.messages.insert_one(bot_message)
+                        await db.messages.replace_one(
+                            {"id": bot_message["id"], "session_id": session_id},
+                            {
+                                **bot_message,
+                                "created_at": datetime.now(),
+                                "updated_at": datetime.now()
+                            },
+                            upsert=True
+                        )
                     except Exception as e:
                         print(f"Error storing bot message: {e}")
                 await manager.send_message(session_id, bot_message)

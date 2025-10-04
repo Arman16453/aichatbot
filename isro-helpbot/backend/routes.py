@@ -5,11 +5,29 @@ from bson import ObjectId
 import uuid
 import database
 from pydantic import BaseModel
+import re
+from collections import defaultdict
+import math
 
 router = APIRouter()
 
 class SessionCreate(BaseModel):
     user_id: Optional[str] = None
+
+class SearchQuery(BaseModel):
+    query: str
+    filters: Optional[dict] = None
+    limit: Optional[int] = 20
+    offset: Optional[int] = 0
+
+class ContentItem(BaseModel):
+    id: str
+    title: str
+    content: str
+    url: str
+    content_type: str
+    indexed_at: datetime
+    relevance_score: Optional[float] = None
 
 @router.post("/sessions/create")
 async def create_session(session_data: Optional[SessionCreate] = None):
@@ -140,3 +158,99 @@ async def update_session_context(session_id: str, context: dict):
             status_code=500,
             detail="Failed to update session context"
         )
+
+# Search System Endpoints
+
+@router.post("/search/index")
+async def index_content():
+    """Index content from MOSDAC website"""
+    try:
+        from main import scrape_mosdac, content_database
+
+        # Scrape content
+        content = scrape_mosdac()
+        if not content:
+            raise HTTPException(status_code=404, detail="No content found to index")
+
+        # Create content document
+        content_doc = {
+            "id": str(uuid.uuid4()),
+            "title": "MOSDAC Main Page",
+            "content": content,
+            "url": "https://www.mosdac.gov.in",
+            "content_type": "webpage",
+            "indexed_at": datetime.utcnow(),
+            "word_count": len(content.split()),
+            "last_updated": datetime.utcnow()
+        }
+
+        # Store in database if available
+        if database.db is not None:
+            try:
+                await database.db.content.replace_one(
+                    {"url": content_doc["url"]},
+                    content_doc,
+                    upsert=True
+                )
+                print(f"Indexed content from {content_doc['url']}")
+            except Exception as db_error:
+                print(f"Database indexing failed: {db_error}")
+
+        # Also store in memory
+        content_database[content_doc["id"]] = content_doc
+
+        return {
+            "status": "indexed",
+            "content_id": content_doc["id"],
+            "word_count": content_doc["word_count"]
+        }
+
+    except HTTPException as http_error:
+        raise http_error
+    except Exception as e:
+        print(f"Error indexing content: {e}")
+        raise HTTPException(status_code=500, detail="Failed to index content")
+
+@router.post("/search")
+async def search_content(search_query: SearchQuery):
+    """Search indexed content with advanced filtering and ranking"""
+    try:
+        from search_utils import search_engine
+
+        # Get all available content
+        content_sources = []
+
+        # Get content from database
+        if database.db is not None:
+            try:
+                db_content = await database.db.content.find({}).to_list(length=None)
+                content_sources.extend(db_content)
+            except Exception as db_error:
+                print(f"Database search failed: {db_error}")
+
+        # Get content from memory
+        from main import content_database
+        content_sources.extend(content_database.values())
+
+        # Remove duplicates based on URL
+        seen_urls = set()
+        unique_content = []
+        for item in content_sources:
+            if item.get("url") not in seen_urls:
+                seen_urls.add(item.get("url"))
+                unique_content.append(item)
+
+        # Perform advanced search
+        search_results = search_engine.search(
+            query=search_query.query,
+            documents=unique_content,
+            filters=search_query.filters,
+            limit=search_query.limit or 20,
+            offset=search_query.offset or 0
+        )
+
+        return search_results
+
+    except Exception as e:
+        print(f"Error searching content: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
