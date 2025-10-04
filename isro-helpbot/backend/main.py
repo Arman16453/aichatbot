@@ -8,8 +8,8 @@ from typing import Dict, List, Optional, Set
 from datetime import datetime
 import uuid
 from pydantic import BaseModel
-from . import routes
-from . import database
+import routes
+import database
 
 # Initialize FastAPI with metadata
 app = FastAPI(
@@ -306,4 +306,4 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: Opt
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
