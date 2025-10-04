@@ -9,3 +9,6 @@ pymongo
 transformers
 torch
 numpy
+scikit-learn
+nltk
+spacy
