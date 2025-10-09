@@ -265,19 +265,32 @@ export default function ChatWindow() {
         };
 
         ws.onerror = (event) => {
-          // event may be opaque; log what we can safely access
+          // The native Event object can be opaque in some browsers/environments.
+          // Avoid trying to JSON-serialize it. Instead log a small, safe summary.
           try {
             const state = ws?.readyState;
-            console.error('WebSocket error event:', { type: (event as Event).type, state }, event);
+            const evType = (event && (event as Event).type) ? (event as Event).type : 'error';
+            // Log a safe, human-readable message rather than passing an object which
+            // some error collectors render as `{}`. This avoids confusing logs.
+            console.error(`WebSocket encountered an error: type=${evType} state=${state}`);
+            // Some environments attach a message field
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const maybeMsg = (event as any)?.message;
+              if (maybeMsg) console.error('WebSocket error message:', maybeMsg);
+            } catch {}
           } catch (e) {
-            console.error('WebSocket error (unable to serialize event):', e);
+            console.error('WebSocket error (logging failed):', e);
           }
 
-          // Only set user-facing error when socket is closed / failed
-          if (ws.readyState === WebSocket.CLOSED) {
+          // Provide a user-facing error depending on socket state.
+          if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
             setError('Connection failed. Please check if the server is running and try again.');
+          } else {
+            setError('WebSocket connection error. Attempting to reconnect...');
           }
 
+          // Close socket to ensure the onclose handler runs and schedules reconnect
           try {
             ws.close();
           } catch (e) {

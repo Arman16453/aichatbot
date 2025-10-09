@@ -34,7 +34,7 @@ async def create_session(session_data: Optional[SessionCreate] = None):
     """Create a new chat session"""
     # Create session document
     session_id = str(uuid.uuid4())
-    now = datetime.utcnow()
+    now = datetime.now()
 
     session = {
         "session_id": session_id,
@@ -127,7 +127,7 @@ async def get_session_messages(session_id: str, limit: int = 50):
 async def update_session_context(session_id: str, context: dict):
     """Update session context"""
     try:
-        if not database.db:
+        if database.db is None:
             raise HTTPException(
                 status_code=503,
                 detail="Database connection not available"
@@ -138,7 +138,7 @@ async def update_session_context(session_id: str, context: dict):
             {
                 "$set": {
                     "context": context,
-                    "last_active": datetime.utcnow()
+                    "last_active": datetime.now()
                 }
             }
         )
@@ -165,44 +165,33 @@ async def update_session_context(session_id: str, context: dict):
 async def index_content():
     """Index content from MOSDAC website"""
     try:
-        from main import scrape_mosdac, content_database
+        from main import scrape_and_index_mosdac, content_database
 
-        # Scrape content
-        content = scrape_mosdac()
-        if not content:
+        # Scrape content into multiple docs
+        docs = scrape_and_index_mosdac()
+        if not docs:
             raise HTTPException(status_code=404, detail="No content found to index")
 
-        # Create content document
-        content_doc = {
-            "id": str(uuid.uuid4()),
-            "title": "MOSDAC Main Page",
-            "content": content,
-            "url": "https://www.mosdac.gov.in",
-            "content_type": "webpage",
-            "indexed_at": datetime.utcnow(),
-            "word_count": len(content.split()),
-            "last_updated": datetime.utcnow()
-        }
+        # Store in database if available and update in-memory index
+        for doc in docs:
+            # set last_updated
+            doc['last_updated'] = datetime.now()
+            if database.db is not None:
+                try:
+                    # Upsert by URL+title to avoid perfect duplicates
+                    await database.db.content.replace_one(
+                        {"url": doc.get('url'), "title": doc.get('title')},
+                        doc,
+                        upsert=True
+                    )
+                except Exception as db_error:
+                    print(f"Database indexing failed for {doc.get('title')}: {db_error}")
 
-        # Store in database if available
-        if database.db is not None:
-            try:
-                await database.db.content.replace_one(
-                    {"url": content_doc["url"]},
-                    content_doc,
-                    upsert=True
-                )
-                print(f"Indexed content from {content_doc['url']}")
-            except Exception as db_error:
-                print(f"Database indexing failed: {db_error}")
-
-        # Also store in memory
-        content_database[content_doc["id"]] = content_doc
+            content_database[doc['id']] = doc
 
         return {
             "status": "indexed",
-            "content_id": content_doc["id"],
-            "word_count": content_doc["word_count"]
+            "count": len(docs)
         }
 
     except HTTPException as http_error:
@@ -254,3 +243,45 @@ async def search_content(search_query: SearchQuery):
     except Exception as e:
         print(f"Error searching content: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
+
+
+class FeedbackItem(BaseModel):
+    content_id: str
+    session_id: Optional[str] = None
+    feedback: str  # e.g., "useful" | "not_relevant"
+    boost: Optional[float] = 0.0
+
+
+@router.post("/feedback")
+async def submit_feedback(item: FeedbackItem):
+    """Submit feedback to improve relevance. Stores a simple boost value per content id.
+
+    This endpoint is intentionally simple: clients can send a small numeric boost
+    (positive or negative) to adjust future rankings.
+    """
+    try:
+        if database.db is None:
+            await database.connect_to_mongodb()
+            if database.db is None:
+                raise HTTPException(status_code=503, detail="Database connection not available")
+
+        # store or upsert adjustment
+        adj = {
+            "content_id": item.content_id,
+            "last_updated": datetime.now(),
+            "boost": float(item.boost or 0.0),
+            "feedback": item.feedback,
+            "session_id": item.session_id
+        }
+        try:
+            await database.db.relevance_adjustments.replace_one({"content_id": item.content_id}, adj, upsert=True)
+        except Exception as e:
+            print(f"Failed to store feedback: {e}")
+
+        return {"status": "recorded", "content_id": item.content_id}
+
+    except HTTPException as http_error:
+        raise http_error
+    except Exception as e:
+        print(f"Error in submit_feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record feedback")

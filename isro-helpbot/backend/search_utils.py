@@ -6,34 +6,42 @@ import re
 import math
 from typing import List, Dict, Tuple, Set
 from collections import Counter, defaultdict
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import PorterStemmer
+# For reliability in constrained environments we disable NLTK by default.
+# If you want NLTK features, set the environment variable USE_NLTK=1 and
+# ensure the required data (punkt, stopwords) is installed.
+import os
+USE_NLTK = os.getenv('USE_NLTK', '0') == '1'
+NLTK_AVAILABLE = False
+if USE_NLTK:
+    try:
+        import nltk
+        from nltk.corpus import stopwords
+        from nltk.stem import PorterStemmer
+        NLTK_AVAILABLE = True
+    except Exception:
+        NLTK_AVAILABLE = False
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
-# Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    try:
-        nltk.download('punkt', quiet=True)
-    except Exception:
-        print("Warning: Could not download NLTK punkt tokenizer")
+DEFAULT_STOPWORDS = set([
+    'the', 'and', 'for', 'that', 'with', 'this', 'from', 'are', 'was', 'were',
+    'have', 'has', 'had', 'not', 'but', 'you', 'your', 'our', 'their', 'they',
+    'them', 'can', 'will', 'would', 'should', 'could', 'about', 'what', 'which',
+    'when', 'where', 'how', 'why', 'all', 'any', 'each', 'other', 'more', 'some'
+])
 
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    try:
-        nltk.download('stopwords', quiet=True)
-    except Exception:
-        print("Warning: Could not download NLTK stopwords")
+# We avoid automatic NLTK downloads at import time to prevent noisy logs.
 
 class SearchEngine:
     def __init__(self):
-        self.stemmer = PorterStemmer()
-        self.stop_words = set(stopwords.words('english'))
+        # PorterStemmer may not be available if NLTK failed to import
+        self.stemmer = PorterStemmer() if NLTK_AVAILABLE else None
+        try:
+            self.stop_words = set(stopwords.words('english')) if NLTK_AVAILABLE else set()
+        except Exception:
+            self.stop_words = set()
         # Add domain-specific stop words
         self.stop_words.update(['mosdac', 'satellite', 'data', 'service', 'services', 'isro'])
 
@@ -41,29 +49,39 @@ class SearchEngine:
         """Preprocess text for search indexing"""
         try:
             # Convert to lowercase
-            text = text.lower()
-
+            text = (text or '').lower()
             # Remove special characters and extra whitespace
             text = re.sub(r'[^\w\s]', ' ', text)
             text = re.sub(r'\s+', ' ', text).strip()
 
-            # Tokenize
-            tokens = nltk.word_tokenize(text)
+            # Tokenize using nltk if available, otherwise simple split
+            if NLTK_AVAILABLE:
+                try:
+                    tokens = nltk.word_tokenize(text)
+                except Exception:
+                    tokens = re.findall(r"\\b\\w+\\b", text)
+            else:
+                tokens = re.findall(r"\\b\\w+\\b", text)
 
-            # Remove stop words and stem
-            processed_tokens = []
+            # Remove stop words and stem if stemmer is available
+            processed_tokens: List[str] = []
             for token in tokens:
                 if token not in self.stop_words and len(token) > 2:
-                    stemmed = self.stemmer.stem(token)
-                    processed_tokens.append(stemmed)
+                    t = token
+                    if self.stemmer:
+                        try:
+                            t = self.stemmer.stem(token)
+                        except Exception:
+                            t = token
+                    processed_tokens.append(t)
 
             return processed_tokens
         except Exception as e:
             print(f"NLTK preprocessing failed: {e}, falling back to simple processing")
             # Fallback: simple split and filter
-            text = text.lower()
-            text = re.sub(r'[^\w\s]', ' ', text)
-            tokens = text.split()
+            text2 = (text or '').lower()
+            text2 = re.sub(r'[^\w\s]', ' ', text2)
+            tokens = re.findall(r"\\b\\w+\\b", text2)
             return [token for token in tokens if len(token) > 2 and token not in self.stop_words]
 
     def calculate_tf_idf_score(self, query: str, documents: List[Dict]) -> List[Tuple[Dict, float]]:
@@ -84,11 +102,23 @@ class SearchEngine:
             doc_metadata.append(doc)
 
         try:
-            # Create TF-IDF vectorizer
+            # Pre-check tokenization to avoid empty-vocabulary errors
+            tokenized_docs = [self.preprocess_text(t) for t in doc_texts]
+            total_tokens = sum(len(td) for td in tokenized_docs)
+            if total_tokens == 0:
+                # Nothing left after preprocessing; use fallback scoring
+                # (this commonly happens when documents are very short or
+                # consist only of stop words)
+                # print a debug-level message instead of an alarming error
+                print("TF-IDF skipped: no tokens after preprocessing; using simple scoring")
+                return self.simple_score(query, documents)
+
+            # Create TF-IDF vectorizer. Provide tokenizer that returns list of tokens
+            # from the raw string, using our preprocess_text function.
             vectorizer = TfidfVectorizer(
-                preprocessor=self.preprocess_text,
-                tokenizer=lambda x: x,  # Already preprocessed
-                token_pattern=None,  # Disable default tokenization
+                tokenizer=self.preprocess_text,
+                preprocessor=None,
+                token_pattern=None,  # ignored when tokenizer is provided
                 max_features=1000
             )
 
@@ -96,8 +126,7 @@ class SearchEngine:
             tfidf_matrix = vectorizer.fit_transform(doc_texts)
 
             # Transform query
-            query_processed = self.preprocess_text(query)
-            query_vector = vectorizer.transform([query_processed])
+            query_vector = vectorizer.transform([query])
 
             # Calculate cosine similarities
             similarities = cosine_similarity(query_vector, tfidf_matrix)[0]
@@ -110,7 +139,7 @@ class SearchEngine:
             return results
 
         except Exception as e:
-            print(f"TF-IDF calculation failed: {e}")
+            print(f"TF-IDF calculation failed, falling back to simple scoring: {e}")
             # Fallback to simple scoring
             return self.simple_score(query, documents)
 

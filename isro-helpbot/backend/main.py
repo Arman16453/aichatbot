@@ -8,47 +8,21 @@ from typing import Dict, List, Optional, Set
 from datetime import datetime
 import uuid
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import routes
 import database
-
-# Initialize FastAPI with metadata
-app = FastAPI(
-    title="ISRO HelpBot API",
-    description="Real-time chat API for ISRO HelpBot",
-    version="1.0.0"
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+import nlp_engine
+from admin_routes import setup_admin_routes
+from content_manager import initialize_content_manager
 
 # Initialize global variables
-content_database: Dict[str, str] = {}
+content_database: Dict[str, dict] = {}
 db = None
 
-def scrape_mosdac() -> str:
-    """Scrape content from MOSDAC website"""
-    try:
-        response = requests.get("https://www.mosdac.gov.in", timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Extract text content
-            text_content = ' '.join([p.get_text() for p in soup.find_all(['p', 'div', 'section'])])
-            return text_content
-        return ""
-    except Exception as e:
-        print(f"Error scraping MOSDAC: {e}")
-        return ""
-
-# Startup and shutdown events
-@app.on_event("startup")
-async def startup_event():
-    """Initialize connections and data on startup"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan events for startup and shutdown"""
+    # Startup
     try:
         # Try to connect to MongoDB (optional)
         try:
@@ -61,10 +35,18 @@ async def startup_event():
             print("Continuing without MongoDB...")
             db = None
         
-        # Initialize content database
-        content = scrape_mosdac()
+        # Initialize content manager
+        try:
+            await initialize_content_manager()
+            print("Content manager initialized")
+        except Exception as e:
+            print(f"Content manager initialization failed: {e}")
+        
+        # Initialize content database by scraping and splitting into documents
         global content_database
-        content_database["mosdac"] = content
+        docs = scrape_and_index_mosdac()
+        for d in docs:
+            content_database[d['id']] = d
         print("Content database initialized")
         
         print("Backend initialization completed")
@@ -72,11 +54,232 @@ async def startup_event():
         print(f"Startup error: {e}")
         # Don't raise the exception, allow the server to start
         print("Server starting without full initialization...")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Close connections on shutdown"""
+    
+    yield
+    
+    # Shutdown
     await database.close_mongodb_connection()
+
+# Initialize FastAPI with metadata and lifespan
+app = FastAPI(
+    title="ISRO HelpBot API",
+    description="Real-time chat API for ISRO HelpBot with MOSDAC integration",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Setup admin routes
+setup_admin_routes(app)
+
+def scrape_mosdac() -> str:
+    """Scrape content from MOSDAC website"""
+    try:
+        response = requests.get("https://www.mosdac.gov.in", timeout=10)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Remove scripts/styles and common layout elements
+            for tag in soup(['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'form']):
+                tag.decompose()
+
+            # Prefer semantic containers: <main>, <article>, or a content div
+            main_content = None
+            main_content = soup.find('main') or soup.find('article')
+            if not main_content:
+                # look for common content id/class patterns
+                main_content = soup.find('div', id=re.compile(r'content|main|page', re.I))
+            if not main_content:
+                main_content = soup.find('div', class_=re.compile(r'content|main|page', re.I))
+
+            if main_content:
+                # Gather meaningful paragraph-like text, preserve headings, lists and links
+                parts = []
+                for el in main_content.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li', 'a']):
+                    txt = el.get_text(separator=' ', strip=True)
+                    if not txt:
+                        continue
+                    # If the element is an anchor, try to capture the href
+                    href = None
+                    try:
+                        if el.name == 'a' and el.has_attr('href'):
+                            href = el['href']
+                        else:
+                            # also check for anchors inside list items or headings
+                            a = el.find('a')
+                            if a and a.has_attr('href'):
+                                href = a['href']
+                    except Exception:
+                        href = None
+
+                    if href:
+                        # normalize relative URLs
+                        if href.startswith('/'):
+                            href = 'https://www.mosdac.gov.in' + href
+                        parts.append(f"{txt} (link: {href})")
+                    else:
+                        parts.append(txt)
+                text_content = '\n'.join(parts)
+            else:
+                # Fallback: minimal body text but try to avoid menus
+                body = soup.body
+                if body:
+                    parts = [p.get_text(separator=' ', strip=True) for p in body.find_all(['p', 'article', 'section'])]
+                    text_content = '\n'.join(parts)
+                else:
+                    text_content = ''
+
+            # Remove obvious navigation/footer repeats and very short menu fragments
+            # and common site boilerplate phrases to avoid returning them as answers.
+            blacklist_phrases = [
+                'skip to main', 'signup', 'sign up', 'login', 'logout', 'secondary menu',
+                'served by', 'copyright', 'privacy policy', 'terms & conditions', 'hyperlink policy',
+                'contact us', 'feedback', 'due to preventive maintenance', 'sitemap', 'help'
+            ]
+            cleaned_lines = []
+            for line in text_content.splitlines():
+                l = line.strip()
+                if not l:
+                    continue
+                low = l.lower()
+                # drop lines that are mostly uppercase menu tokens or contain blacklist phrases
+                if any(bp in low for bp in blacklist_phrases):
+                    continue
+                # drop lines which are too short or are just repeated tokens
+                if len(l) < 30:
+                    # small chance it's useful; keep if contains a verb-like token
+                    if re.search(r'\b(is|are|provide|offers|access|data|download|product)\b', low):
+                        cleaned_lines.append(l)
+                    continue
+                cleaned_lines.append(l)
+
+            cleaned = '\n'.join(cleaned_lines)
+            # Truncate content to a reasonable size to avoid huge responses
+            max_len = 20000
+            if len(cleaned) > max_len:
+                cleaned = cleaned[:max_len]
+            return cleaned
+        return ""
+    except Exception as e:
+        print(f"Error scraping MOSDAC: {e}")
+        return ""
+
+
+def scrape_and_index_mosdac() -> list:
+    """Scrape MOSDAC and produce a list of structured content documents.
+
+    Returns a list of documents suitable for indexing/searching. Each anchor
+    (announcement/link) becomes a separate doc when possible, plus a main page
+    doc as a fallback.
+    """
+    docs = []
+    try:
+        response = requests.get("https://www.mosdac.gov.in", timeout=10)
+        if response.status_code != 200:
+            return docs
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for tag in soup(['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside', 'form']):
+            tag.decompose()
+
+        main_content = soup.find('main') or soup.find('article')
+        if not main_content:
+            main_content = soup.find('div', id=re.compile(r'content|main|page', re.I))
+        if not main_content:
+            main_content = soup.find('div', class_=re.compile(r'content|main|page', re.I))
+
+        seen_urls = set()
+
+        if main_content:
+            # first, index anchor items (announcements, pdf links, etc.)
+            for a in main_content.find_all('a'):
+                try:
+                    text = a.get_text(separator=' ', strip=True)
+                    href = a.get('href')
+                    if not text or not href:
+                        continue
+                    # normalize href
+                    if href.startswith('/'):
+                        href = 'https://www.mosdac.gov.in' + href
+                    if href in seen_urls:
+                        continue
+                    seen_urls.add(href)
+
+                    # gather surrounding context (parent paragraph or list item)
+                    parent = a.find_parent(['p', 'li', 'div', 'section', 'article'])
+                    context_text = ''
+                    if parent:
+                        context_text = parent.get_text(separator=' ', strip=True)
+
+                    doc = {
+                        'id': str(uuid.uuid4()),
+                        'title': text,
+                        'content': context_text or text,
+                        'url': href,
+                        'content_type': 'link',
+                        'indexed_at': datetime.now(),
+                        'word_count': len((context_text or text).split())
+                    }
+                    docs.append(doc)
+                except Exception:
+                    continue
+
+            # also add paragraphs/headings as separate docs if they look important
+            for el in main_content.find_all(['h1', 'h2', 'h3', 'h4', 'p']):
+                try:
+                    txt = el.get_text(separator=' ', strip=True)
+                    if not txt or len(txt) < 40:
+                        continue
+                    # avoid duplicating already indexed urls/text
+                    if txt in [d['content'] for d in docs]:
+                        continue
+                    doc = {
+                        'id': str(uuid.uuid4()),
+                        'title': (el.name + ': ' + txt[:80]) if el.name.startswith('h') else txt[:60],
+                        'content': txt,
+                        'url': 'https://www.mosdac.gov.in',
+                        'content_type': 'paragraph',
+                        'indexed_at': datetime.now(),
+                        'word_count': len(txt.split())
+                    }
+                    docs.append(doc)
+                except Exception:
+                    continue
+
+        # If nothing found, create a fallback doc with body text
+        if not docs:
+            body = soup.body
+            text_content = ''
+            if body:
+                parts = [p.get_text(separator=' ', strip=True) for p in body.find_all(['p', 'section', 'article'])]
+                text_content = '\n'.join([p for p in parts if p])
+            docs.append({
+                'id': 'mosdac',
+                'title': 'MOSDAC Main Page',
+                'content': text_content,
+                'url': 'https://www.mosdac.gov.in',
+                'content_type': 'webpage',
+                'indexed_at': datetime.now(),
+                'word_count': len(text_content.split())
+            })
+
+        # truncate and clean docs
+        for d in docs:
+            if d.get('content') and len(d['content']) > 20000:
+                d['content'] = d['content'][:20000]
+
+        return docs
+    except Exception as e:
+        print('Error in scrape_and_index_mosdac:', e)
+        return docs
 
 class Session(BaseModel):
     session_id: str
@@ -98,6 +301,18 @@ class Message(BaseModel):
 
 # Include routes
 app.include_router(routes.router, prefix="/api")
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "database_connected": db is not None,
+        "content_database_size": len(content_database),
+        "version": "1.0.0"
+    }
 
 # Store active websocket connections
 class ConnectionManager:
@@ -189,47 +404,13 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-async def get_ai_response(question: str) -> str:
-    """Generate AI response based on the question and scraped content"""
+async def get_ai_response(question: str, session_id: str) -> str:
+    """Delegate response generation to the NLP engine module."""
     try:
-        # For now, use a simple rule-based response system
-        # This can be enhanced with actual AI models later
-        question_lower = question.lower().strip()
-        
-        # Handle greetings and casual questions
-        if any(greeting in question_lower for greeting in ['hello', 'hi', 'hey', 'how are you', 'how do you do']):
-            return "Hello! I'm doing well, thank you for asking. I'm here to help you with information about MOSDAC's satellite data and services. What would you like to know about our meteorological and oceanographic data?"
-        
-        # Handle questions about MOSDAC
-        elif any(keyword in question_lower for keyword in ['what is mosdac', 'mosdac', 'satellite data', 'data']):
-            return "MOSDAC (Meteorological and Oceanographic Satellite Data Archival Centre) is ISRO's data archival center that provides satellite data and services. We offer various satellite products, meteorological data, and oceanographic information. You can access real-time and historical data through our portal."
-        
-        # Handle weather-related questions
-        elif any(keyword in question_lower for keyword in ['weather', 'meteorology', 'forecast', 'temperature', 'rain', 'climate']):
-            return "MOSDAC offers comprehensive meteorological satellite data including weather monitoring, atmospheric parameters, and forecasting products. You can access real-time weather data, historical meteorological information, and climate datasets. Our data includes temperature, humidity, precipitation, and atmospheric pressure measurements."
-        
-        # Handle ocean-related questions
-        elif any(keyword in question_lower for keyword in ['ocean', 'sea', 'marine', 'water', 'coastal']):
-            return "Our oceanographic data includes sea surface temperature, ocean color, sea level measurements, and marine meteorological parameters. These datasets are essential for marine research, coastal monitoring, and oceanographic studies. You can access both real-time and historical ocean data."
-        
-        # Handle data access questions
-        elif any(keyword in question_lower for keyword in ['download', 'access', 'get data', 'how to', 'where to']):
-            return "You can download satellite data and products from our portal at www.mosdac.gov.in. Visit the data download section to access various datasets. Some products may require registration. We provide data in various formats including NetCDF, HDF, and GeoTIFF."
-        
-        # Handle help and support questions
-        elif any(keyword in question_lower for keyword in ['help', 'support', 'assistance', 'guide']):
-            return "I'm here to help you with information about MOSDAC's satellite data and services. You can ask me about specific data products, how to access them, data formats, or general information about our services. What specific information do you need?"
-        
-        # Handle technical questions
-        elif any(keyword in question_lower for keyword in ['format', 'resolution', 'frequency', 'satellite', 'sensor']):
-            return "MOSDAC provides data from various satellites including INSAT, Oceansat, and other ISRO missions. Data is available in different formats (NetCDF, HDF, GeoTIFF) with varying spatial and temporal resolutions. The data frequency depends on the satellite and sensor specifications."
-        
-        # Default response for other questions
-        else:
-            return "I can help you with information about MOSDAC's satellite data, meteorological products, oceanographic data, and services. You can ask me about:\n\n• Weather and climate data\n• Ocean and marine data\n• How to download data\n• Data formats and specifications\n• Satellite information\n\nWhat specific topic would you like to know more about?"
-
+        return await nlp_engine.get_ai_response(question, session_id, db, content_database)
     except Exception as e:
-        return "I apologize, but I encountered an error processing your question. Please try asking your question differently, or ask me about MOSDAC's satellite data and services."
+        print(f"Error in NLP engine: {e}")
+        return "I apologize, something went wrong while generating the response. Please try again."
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: Optional[str] = None):
@@ -276,7 +457,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: Opt
             
             try:
                 # Get bot response
-                bot_response = await get_ai_response(user_message)
+                bot_response = await get_ai_response(user_message, session_id)
                 
                 # Create bot message data
                 bot_message = {
@@ -329,4 +510,4 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str, user_id: Opt
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)

@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Tabs, Tab, Box, Paper } from "@mui/material";
 import ChatWindow from "@/components/chat/ChatWindow";
 import SearchInterface from "@/components/SearchInterface";
+import AdminDashboard from "@/components/AdminDashboard";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -48,31 +49,49 @@ export default function Home() {
             MOSDAC AI Assistant
           </h1>
           <p className="text-center text-gray-600 mt-2">
-            Ask questions or search through MOSDAC satellite data and services
+            Intelligent satellite data assistance powered by ISRO
           </p>
         </div>
 
-        <Paper elevation={3} sx={{ mb: 3 }}>
+        <Paper elevation={3} style={{ borderRadius: '12px', overflow: 'hidden' }}>
           <Tabs
             value={tabValue}
             onChange={handleTabChange}
-            aria-label="main navigation tabs"
-            centered
+            indicatorColor="primary"
+            textColor="primary"
+            variant="fullWidth"
+            sx={{
+              backgroundColor: '#1976d2',
+              '& .MuiTab-root': {
+                color: 'white',
+                fontWeight: 'bold',
+              },
+              '& .Mui-selected': {
+                color: 'white !important',
+              },
+              '& .MuiTabs-indicator': {
+                backgroundColor: 'white',
+                height: '3px',
+              },
+            }}
           >
-            <Tab label="Chat Assistant" />
-            <Tab label="Search Content" />
+            <Tab label="🤖 Chat Assistant" />
+            <Tab label="🔍 Search Portal" />
+            <Tab label="⚙️ Admin Dashboard" />
           </Tabs>
-        </Paper>
 
-        <TabPanel value={tabValue} index={0}>
-          <div className="w-full max-w-4xl mx-auto">
+          <TabPanel value={tabValue} index={0}>
             <ChatWindow />
-          </div>
-        </TabPanel>
+          </TabPanel>
+          
+          <TabPanel value={tabValue} index={1}>
+            <SearchInterface />
+          </TabPanel>
 
-        <TabPanel value={tabValue} index={1}>
-          <SearchInterface />
-        </TabPanel>
+          <TabPanel value={tabValue} index={2}>
+            <AdminDashboard />
+          </TabPanel>
+        </Paper>
       </div>
     </main>
   );
